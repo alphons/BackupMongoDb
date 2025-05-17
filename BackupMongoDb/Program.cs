@@ -1,4 +1,4 @@
 ﻿
 using BackupMongoDb;
 
-await Helper.BackupAsync(@"c:\temp");
+await Helper.BackupAsync(args.Length == 0 ? @"c:\temp" : args[0]);
