@@ -3,7 +3,9 @@ using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Security.AccessControl;
 using System.Security.Principal;
+using System.ServiceProcess;
 
 namespace BackupMongoDb;
 
@@ -14,11 +16,9 @@ public class Helper
 	{
 		try
 		{
-#pragma warning disable CA1416 // Validate platform compatibility
 			using var identity = WindowsIdentity.GetCurrent();
 			var principal = new WindowsPrincipal(identity);
 			return principal.IsInRole(WindowsBuiltInRole.Administrator);
-#pragma warning restore CA1416 // Validate platform compatibility
 		}
 		catch (Exception ex)
 		{
@@ -144,7 +144,7 @@ public class Helper
 		}
 	}
 
-	public static async Task<bool> BackupAsync(string backupDir, string connectionString = "mongodb://localhost:27017")
+	public static async Task<bool> BackupAsync(string backupDir, string connectionString)
 	{
 		MongoClient? client;
 		IMongoDatabase? database = null;
@@ -236,6 +236,147 @@ public class Helper
 				{
 					Console.WriteLine($"Error unlocking database: {ex.Message}");
 				}
+			}
+		}
+	}
+
+	public static async Task<bool> RestoreAsync(string zipFilePath, string connectionString)
+	{
+		MongoClient? client = null;
+		var sw = Stopwatch.StartNew();
+
+		try
+		{
+			// Controleer of de applicatie als administrator draait
+			if (!IsRunningAsAdministrator())
+			{
+				Console.WriteLine("This application must be run as an administrator to perform a MongoDB restore.");
+				return false;
+			}
+
+			// Valideer ZIP-bestand
+			if (string.IsNullOrWhiteSpace(zipFilePath) || !File.Exists(zipFilePath))
+			{
+				Console.WriteLine($"ZIP file '{zipFilePath}' is invalid or does not exist.");
+				return false;
+			}
+
+			// Maak MongoDB-client en haal datadirectory op
+			client = new MongoClient(connectionString);
+			var database = client.GetDatabase("admin");
+			var command = new BsonDocument { { "getCmdLineOpts", 1 } };
+			var result = await database.RunCommandAsync<BsonDocument>(command);
+			string? dataDirectory = result["parsed"]?["storage"]?["dbPath"]?.AsString;
+
+			if (string.IsNullOrEmpty(dataDirectory))
+			{
+				Console.WriteLine("Failed to retrieve MongoDB data directory (dbPath).");
+				return false;
+			}
+
+			// Controleer of de datadirectory bestaat, zo niet, maak deze aan
+			if (!Directory.Exists(dataDirectory))
+			{
+				Directory.CreateDirectory(dataDirectory);
+			}
+
+			// Stop de MongoDB-service
+			Console.WriteLine("Stopping MongoDB service...");
+			using (var serviceController = new ServiceController("MongoDB"))
+			{
+				if (serviceController.Status != ServiceControllerStatus.Stopped)
+				{
+					serviceController.Stop();
+					serviceController.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+				}
+			}
+			Console.WriteLine("MongoDB service stopped successfully.");
+
+			// Maak een back-up van de huidige datadirectory (optioneel)
+			string backupCurrentDir = Path.Combine(Path.GetDirectoryName(dataDirectory) ?? throw new InvalidOperationException("Invalid data directory path"), $"mongodb_data_backup_{DateTime.Now:yyyyMMdd_HHmmss}");
+			if (Directory.Exists(dataDirectory) && Directory.GetFiles(dataDirectory).Length > 0)
+			{
+				Console.WriteLine($"Backing up current data directory to '{backupCurrentDir}'...");
+				Directory.Move(dataDirectory, backupCurrentDir);
+				Directory.CreateDirectory(dataDirectory); // Maak lege datadirectory aan
+			}
+
+			// Extraheer de ZIP naar de datadirectory
+			Console.WriteLine($"Extracting ZIP file '{zipFilePath}' to '{dataDirectory}'...");
+			using (var zip = ZipFile.OpenRead(zipFilePath))
+			{
+				foreach (var entry in zip.Entries)
+				{
+					string destinationPath = Path.Combine(dataDirectory, entry.FullName);
+					// Zorg dat de directorystructuur bestaat
+					string? destinationDir = Path.GetDirectoryName(destinationPath);
+					if (!string.IsNullOrEmpty(destinationDir))
+					{
+						Directory.CreateDirectory(destinationDir);
+					}
+					// Extraheer het bestand
+					entry.ExtractToFile(destinationPath, overwrite: true);
+				}
+			}
+			Console.WriteLine("ZIP file extracted successfully.");
+
+			// Stel bestandsrechten in (optioneel, afhankelijk van je setup)
+			// Bijv. geef SYSTEM en Administrators volledige rechten
+			try
+			{
+				var directoryInfo = new DirectoryInfo(dataDirectory);
+				var security = directoryInfo.GetAccessControl();
+				security.AddAccessRule(new FileSystemAccessRule(
+					new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null),
+					FileSystemRights.FullControl,
+					InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit,
+					PropagationFlags.None,
+					AccessControlType.Allow));
+				directoryInfo.SetAccessControl(security);
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Warning: Failed to set file permissions: {ex.Message}");
+			}
+
+			// Start de MongoDB-service
+			Console.WriteLine("Starting MongoDB service...");
+			using (var serviceController = new ServiceController("MongoDB"))
+			{
+				serviceController.Start();
+				serviceController.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+			}
+			Console.WriteLine("MongoDB service started successfully.");
+
+			// Controleer of de database toegankelijk is
+			Console.WriteLine("Verifying database access...");
+			var dbs = await (await client.ListDatabasesAsync()).ToListAsync();
+			Console.WriteLine($"Databases found: {string.Join(", ", dbs.Select(db => db["name"].AsString))}");
+
+			Console.WriteLine($"Restore completed successfully in {sw.Elapsed}");
+			return true;
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Restore failed: {ex.Message}");
+			return false;
+		}
+		finally
+		{
+			// Zorg dat de MongoDB-service draait, zelfs bij een fout
+			try
+			{
+				using var serviceController = new ServiceController("MongoDB");
+				if (serviceController.Status != ServiceControllerStatus.Running)
+				{
+					serviceController.Start();
+					serviceController.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+					Console.WriteLine("MongoDB service restarted after error.");
+				}
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"Error restarting MongoDB service: {ex.Message}");
 			}
 		}
 	}
