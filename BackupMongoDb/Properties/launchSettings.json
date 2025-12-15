@@ -1,0 +1,8 @@
+{
+  "profiles": {
+    "BackupMongoDb": {
+      "commandName": "Project",
+      "commandLineArgs": "-backup c:\\temp"
+    }
+  }
+}
