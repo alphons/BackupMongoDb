@@ -1,8 +1,9 @@
-﻿using Alphaleonis.Win32.Vss;
+﻿
 using MongoDB.Bson;
 using MongoDB.Driver;
 using System.Diagnostics;
 using System.IO.Compression;
+using System.Management;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.ServiceProcess;
@@ -29,118 +30,138 @@ public class Helper
 
 	private static async Task<bool> ZipFromSnapshotAsync(string sourceDirectory, string zipPath)
 	{
-		IVssFactory? vssFactory = null;
-		IVssBackupComponents? backup = null;
+		if (!Directory.Exists(sourceDirectory))
+		{
+			Console.WriteLine($"Source directory '{sourceDirectory}' does not exist.");
+			return false;
+		}
+
+		string? targetDir = Path.GetDirectoryName(zipPath);
+		if (!string.IsNullOrEmpty(targetDir) && !Directory.Exists(targetDir))
+		{
+			Directory.CreateDirectory(targetDir);
+		}
+
+		if (File.Exists(zipPath))
+		{
+			try
+			{
+				File.Delete(zipPath);
+			}
+			catch (IOException ex)
+			{
+				Console.WriteLine($"Failed to delete existing ZIP file '{zipPath}': {ex.Message}");
+				return false;
+			}
+		}
+
+		ManagementScope scope = new(@"\\.\root\cimv2");
+		scope.Connect();
+
+		string volume = Path.GetPathRoot(sourceDirectory) ?? throw new InvalidOperationException("Invalid path root.");
+
+		// Create snapshot
+		ObjectGetOptions options = new();
+		ManagementClass shadowCopyClass = new(scope, new ManagementPath("Win32_ShadowCopy"), options);
+		ManagementBaseObject inParams = shadowCopyClass.GetMethodParameters("Create");
+		inParams["Context"] = "ClientAccessible";
+		inParams["Volume"] = volume;
+
+		ManagementBaseObject outParams = shadowCopyClass.InvokeMethod("Create", inParams, null);
+		uint result = (uint)outParams["ReturnValue"];
+		if (result != 0)
+		{
+			Console.WriteLine($"Failed to create shadow copy. Error code: {result}");
+			return false;
+		}
+
+		string shadowId = outParams["ShadowID"].ToString() ?? string.Empty;
+		string deviceObject = string.Empty;
+
+		// Find device path
+		using (ManagementObjectSearcher searcher = new(scope, new SelectQuery("SELECT * FROM Win32_ShadowCopy WHERE ID='" + shadowId + "'")))
+		{
+			foreach (ManagementObject obj in searcher.Get().Cast<ManagementObject>())
+			{
+				deviceObject = obj["DeviceObject"].ToString() ?? string.Empty;
+				break;
+			}
+		}
+
+		if (string.IsNullOrEmpty(deviceObject))
+		{
+			Console.WriteLine("Failed to retrieve shadow device path.");
+			return false;
+		}
+
+		// Ensure trailing backslash
+		if (!deviceObject.EndsWith('\\'))
+		{
+			deviceObject += "\\";
+		}
+
+		string relativePath = sourceDirectory[volume.Length..].TrimStart('\\');
+		string snapshotSourcePath = Path.Combine(deviceObject, relativePath);
+
+		Console.WriteLine($"Zipping from snapshot '{snapshotSourcePath}' to '{zipPath}'...");
+
 		try
 		{
-			// Valideer source directory
-			if (!Directory.Exists(sourceDirectory))
-			{
-				Console.WriteLine($"Source directory '{sourceDirectory}' does not exist.");
-				return false;
-			}
-
-			// Zorg ervoor dat de doeldirectory bestaat
-			string? targetDir = Path.GetDirectoryName(zipPath);
-			if (!string.IsNullOrEmpty(targetDir) && !Directory.Exists(targetDir))
-			{
-				Directory.CreateDirectory(targetDir);
-			}
-
-			// Verwijder bestaand ZIP-bestand met foutafhandeling
-			if (File.Exists(zipPath))
-			{
-				try
-				{
-					File.Delete(zipPath);
-				}
-				catch (IOException ex)
-				{
-					Console.WriteLine($"Failed to delete existing ZIP file '{zipPath}': {ex.Message}");
-					return false;
-				}
-			}
-
-			// Initialiseer VSS
-			vssFactory = VssFactoryProvider.Default.GetVssFactory();
-			backup = vssFactory.CreateVssBackupComponents();
-			backup.InitializeForBackup(null);
-			backup.GatherWriterMetadata();
-			backup.SetBackupState(false, true, VssBackupType.Full, false);
-			backup.SetContext(VssSnapshotContext.Backup);
-
-			// Bepaal het volume (bijv. C:\)
-			string volumePath = Path.GetPathRoot(sourceDirectory)?.TrimEnd('\\') ?? throw new ArgumentException("Could not determine volume for source directory.");
-			if (!Directory.Exists(volumePath))
-			{
-				Console.WriteLine($"Volume '{volumePath}' does not exist.");
-				return false;
-			}
-
-			volumePath += '\\';
-
-			// Maak een VSS-snapshot van het volume
-			Console.WriteLine($"Creating VSS snapshot for volume '{volumePath}' to back up directory '{sourceDirectory}'...");
-			Guid setId = backup.StartSnapshotSet();
-			Guid snapshotId = backup.AddToSnapshotSet(volumePath);
-			backup.PrepareForBackup();
-
-			await Task.Run(() => backup.DoSnapshotSet()); // Asynchroon in een Task
-
-			var snapshotProperties = backup.GetSnapshotProperties(snapshotId);
-			var snapshotDevicePath = snapshotProperties.SnapshotDeviceObject;
-			var relativePath = sourceDirectory[volumePath.Length..].TrimStart('\\');
-			var snapshotSourcePath = Path.Combine(snapshotDevicePath, relativePath);
-
-			Console.WriteLine($"VSS snapshot created successfully");
-			// Controleer of het snapshot-pad toegankelijk is
-			if (!Directory.Exists(snapshotSourcePath))
-			{
-				Console.WriteLine($"Snapshot source path '{snapshotSourcePath}' is not accessible.");
-				return false;
-			}
-
-			// Maak ZIP-bestand van alleen de bestanden in de hoofddirectory van de snapshot
-			Console.WriteLine($"Zipping files to '{zipPath}'...");
 			using (var zip = ZipFile.Open(zipPath, ZipArchiveMode.Create))
 			{
 				foreach (string file in Directory.GetFiles(snapshotSourcePath, "*", SearchOption.TopDirectoryOnly))
 				{
 					if (Path.GetExtension(file) == ".lock")
+					{
 						continue;
-					string entryName = Path.GetFileName(file); // Alleen bestandsnaam, geen directorystructuur
+					}
+
+					string entryName = Path.GetFileName(file);
 					zip.CreateEntryFromFile(file, entryName, CompressionLevel.Optimal);
 				}
 			}
-			Console.WriteLine($"ZIP file created successfully");
 
-			backup.DeleteSnapshotSet(setId, false);
-			Console.WriteLine($"DeleteSnapshotSet successfully");
-
+			Console.WriteLine("ZIP file created successfully from snapshot");
 			return true;
-		}
-		catch (VssException ex)
-		{
-			Console.WriteLine($"VSS error: {ex.Message}");
-			return false;
-		}
-		catch (Exception ex)
-		{
-			Console.WriteLine($"Error zipping '{sourceDirectory}' to '{zipPath}': {ex.Message}");
-			return false;
 		}
 		finally
 		{
-			// Ruim VSS op
-			try
+			// Always delete snapshot
+			if (!string.IsNullOrEmpty(shadowId))
 			{
-				backup?.BackupComplete();
+				try
+				{
+					await Task.Delay(3000); // Longer wait for file system release
+
+					using ManagementObjectSearcher searcher = new(
+						scope,
+						new SelectQuery($"SELECT * FROM Win32_ShadowCopy WHERE ID='{shadowId}'"));
+
+					ManagementObjectCollection collection = searcher.Get();
+
+					if (collection.Count == 0)
+					{
+						Console.WriteLine("Shadow copy already removed or not found.");
+					}
+					else
+					{
+						foreach (ManagementObject shadow in collection.Cast<ManagementObject>())
+						{
+							shadow.Delete();
+							Console.WriteLine("Shadow copy deleted successfully.");
+							break;
+						}
+					}
+				}
+				catch (ManagementException mex) when (mex.ErrorCode == ManagementStatus.NotFound)
+				{
+					Console.WriteLine("Shadow copy not found during cleanup.");
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"Failed to delete shadow copy: {ex.Message}");
+				}
 			}
-			catch (Exception ex)
-			{
-				Console.WriteLine($"Error completing VSS backup: {ex.Message}");
-			}
-			backup?.Dispose();
 		}
 	}
 
@@ -380,4 +401,65 @@ public class Helper
 			}
 		}
 	}
+
+	public static void ListAllShadowCopies(bool deleteCopies = false)
+	{
+		try
+		{
+			ManagementScope scope = new (@"\\.\root\cimv2");
+			scope.Connect();
+
+			using ManagementObjectSearcher searcher = new (scope, new SelectQuery("SELECT * FROM Win32_ShadowCopy"));
+			using ManagementObjectCollection collection = searcher.Get();
+
+			if (collection.Count == 0)
+			{
+				Console.WriteLine("No lingering shadow copies found.");
+				return;
+			}
+
+			Console.WriteLine($"Found {collection.Count} shadow copy(ies):");
+
+			foreach (ManagementObject shadow in collection.Cast<ManagementObject>())
+			{
+				try
+				{
+					string id = shadow["ID"]?.ToString() ?? "Unknown";
+
+					if (deleteCopies)
+					{
+						shadow.Delete();
+						Console.WriteLine($"Deleted shadow copy ID: {id}");
+					}
+					else
+					{
+						string deviceObject = shadow["DeviceObject"]?.ToString() ?? "Unknown";
+						string volume = shadow["VolumeName"]?.ToString() ?? "Unknown";
+						string installDate = ManagementDateTimeConverter.ToDateTime(shadow["InstallDate"]?.ToString() ?? string.Empty)
+							.ToString("yyyy-MM-dd HH:mm:ss");
+
+						Console.WriteLine($"ID: {id}");
+						Console.WriteLine($"  DeviceObject: {deviceObject}");
+						Console.WriteLine($"  Volume: {volume}");
+						Console.WriteLine($"  InstallDate: {installDate}");
+						Console.WriteLine("---");
+					}
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"Failed on shadow copy: {ex.Message}");
+				}
+			}
+
+			if (deleteCopies)
+			{
+				Console.WriteLine("Cleanup completed.");
+			}
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"Error querying shadow copies: {ex.Message}");
+		}
+	}
+
 }
